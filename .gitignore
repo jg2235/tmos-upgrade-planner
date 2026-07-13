@@ -1,0 +1,20 @@
+# generated reports
+*.html
+*.xlsx
+out/
+reports/
+
+# release-note inputs (large; users download their own from my.f5.com)
+BIG-IP-*.html
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# credentials / env — never commit
+.env
+*.pem
+*.key
+ihealth_credentials*
