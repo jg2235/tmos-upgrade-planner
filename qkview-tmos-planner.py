@@ -182,9 +182,11 @@ class IHealthClient:
         return info
 
 
-def fetch_config_from_ihealth(qid: str) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """Returns ({name: text}, identity) for the QKView's config files."""
-    client = IHealthClient()
+def fetch_config_from_ihealth(qid: str, client: Optional["IHealthClient"] = None
+                              ) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Returns ({name: text}, identity) for the QKView's config files.
+    Pass a shared client to reuse one OAuth token across multiple QKViews."""
+    client = client or IHealthClient()
     files = client.list_files(qid)
     by_path = {p: h for h, p in files}
     out: Dict[str, str] = {}
@@ -1666,7 +1668,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         description="Associate BIG-IP QKView configuration with TMOS release-note "
                     "items and produce a scored HTML + Excel advisory report.")
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--qkview-id", help="iHealth QKView ID (live pull via Files API)")
+    src.add_argument("--qkview-id", action="append",
+                     help="iHealth QKView ID (live pull via Files API). "
+                          "Repeatable, and each value may be a comma-separated "
+                          "list; one report pair is produced per QKView, named "
+                          "<out-prefix>_<qkview-id>.html/.xlsx")
     src.add_argument("--offline", action="store_true",
                      help="read local config files instead of iHealth")
     ap.add_argument("--bigip-conf", help="path to bigip.conf (offline mode)")
@@ -1681,12 +1687,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="output file prefix (default tmos_rn_report)")
     args = ap.parse_args(argv)
 
-    # ---- acquire configuration
-    conf_texts: Dict[str, str] = {}
-    hostname = args.hostname
+    # ---- parse release notes ONCE (shared across all QKViews)
+    releases: List[ReleaseNotes] = []
+    for p in args.rn:
+        if not os.path.isfile(p):
+            print(f"error: release-note file {p} not found", file=sys.stderr)
+            return 2
+        rn = parse_release_notes(p)
+        print(f"  parsed {rn.filename}: v{rn.version} build {rn.build}, "
+              f"{len(rn.items)} items "
+              f"({sum(1 for i in rn.items.values() if i.known_issue)} known issues)",
+              file=sys.stderr)
+        releases.append(rn)
+    releases.sort(key=lambda r: _vtuple(r.version))
+
+    # ---- build the list of config sources
+    # each entry: (label_for_filenames_or_None, conf_texts, hostname, version)
+    sources: List[Tuple[Optional[str], Dict[str, str], str, str]] = []
     if args.offline:
         if not args.bigip_conf:
             ap.error("--offline requires --bigip-conf")
+        conf_texts: Dict[str, str] = {}
         for label, p in (("bigip.conf", args.bigip_conf),
                          ("gtm.conf", args.gtm_conf),
                          ("bigip_base.conf", args.base_conf)):
@@ -1695,18 +1716,60 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"error: {p} not found", file=sys.stderr); return 2
                 conf_texts[label] = open(p, encoding="utf-8",
                                          errors="replace").read()
-        hostname = hostname or "offline-config"
+        sources.append((None, conf_texts, args.hostname or "offline-config",
+                        args.current_version))
     else:
-        print(f"Pulling config for QKView {args.qkview_id} from iHealth ...",
-              file=sys.stderr)
-        conf_texts, ident = fetch_config_from_ihealth(args.qkview_id)
-        hostname = hostname or ident.get("hostname", f"qkview-{args.qkview_id}")
-        if ident.get("version") and args.current_version == "17.1.3":
-            args.current_version = ident["version"]
-        if not conf_texts:
-            print("error: no config files retrieved from iHealth", file=sys.stderr)
+        qids: List[str] = []
+        for v in args.qkview_id:
+            qids += [q.strip() for q in v.split(",") if q.strip()]
+        if not qids:
+            ap.error("--qkview-id given but no IDs parsed")
+        client = IHealthClient()
+        failures: List[str] = []
+        for qid in qids:
+            print(f"Pulling config for QKView {qid} from iHealth ...",
+                  file=sys.stderr)
+            try:
+                conf_texts, ident = fetch_config_from_ihealth(qid, client)
+            except Exception as e:              # isolate per-QKView failures
+                print(f"  ERROR: QKView {qid}: {e}", file=sys.stderr)
+                failures.append(qid)
+                continue
+            if not conf_texts:
+                print(f"  ERROR: QKView {qid}: no config files retrieved",
+                      file=sys.stderr)
+                failures.append(qid)
+                continue
+            host = args.hostname or ident.get("hostname", f"qkview-{qid}")
+            ver = (ident.get("version")
+                   if ident.get("version") and args.current_version == "17.1.3"
+                   else args.current_version)
+            sources.append((qid, conf_texts, host, ver))
+        if not sources:
+            print("error: all QKViews failed", file=sys.stderr)
             return 2
+    rc_failures = len(qids) - len(sources) if not args.offline else 0
 
+    # ---- analyze each source
+    for src_label, conf_texts, hostname, current_version in sources:
+        suffix = f"_{src_label}" if src_label else ""
+        print(f"\n=== Analyzing "
+              f"{hostname}{f' (QKView {src_label})' if src_label else ''} "
+              f"running {current_version} ===", file=sys.stderr)
+        rc = _analyze_one(conf_texts, hostname, current_version, releases,
+                          f"{args.out_prefix}{suffix}")
+        if rc != 0:
+            return rc
+    if not args.offline and rc_failures:
+        print(f"\nWARNING: {rc_failures} QKView(s) failed — see errors above",
+              file=sys.stderr)
+        return 3
+    return 0
+
+
+def _analyze_one(conf_texts: Dict[str, str], hostname: str,
+                 current_version: str, releases: List[ReleaseNotes],
+                 out_prefix: str) -> int:
     # ---- parse config, detect features
     objs: List[ConfigObject] = []
     for label, text in conf_texts.items():
@@ -1723,23 +1786,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  detected {len(features)} active features, "
           f"{sum(len(f.instances) for f in features)} instances", file=sys.stderr)
 
-    # ---- parse release notes
-    releases: List[ReleaseNotes] = []
-    for p in args.rn:
-        if not os.path.isfile(p):
-            print(f"error: release-note file {p} not found", file=sys.stderr)
-            return 2
-        rn = parse_release_notes(p)
-        print(f"  parsed {rn.filename}: v{rn.version} build {rn.build}, "
-              f"{len(rn.items)} items "
-              f"({sum(1 for i in rn.items.values() if i.known_issue)} known issues)",
-              file=sys.stderr)
-        releases.append(rn)
-    releases.sort(key=lambda r: _vtuple(r.version))
-
     # ---- match + score
     matches, platform, remediated, unmatched = run_matching(
-        features, releases, comps, args.current_version)
+        features, releases, comps, current_version)
     print(f"  matches: {len(matches)} "
           f"(exact {sum(1 for m in matches if m.band=='exact')}, "
           f"probable {sum(1 for m in matches if m.band=='probable')}, "
@@ -1758,14 +1807,14 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
 
     # ---- reports
-    html_path = f"{args.out_prefix}.html"
-    xlsx_path = f"{args.out_prefix}.xlsx"
+    html_path = f"{out_prefix}.html"
+    xlsx_path = f"{out_prefix}.xlsx"
     with open(html_path, "w", encoding="utf-8") as fh:
         fh.write(build_html(features, releases, matches, platform, remediated,
-                            unmatched, comps, args.current_version, hostname,
+                            unmatched, comps, current_version, hostname,
                             comparison))
     build_xlsx(xlsx_path, features, releases, matches, platform, remediated,
-               unmatched, args.current_version, hostname, comparison)
+               unmatched, current_version, hostname, comparison)
     print(f"wrote {html_path}\nwrote {xlsx_path}")
     return 0
 
