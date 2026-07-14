@@ -1131,16 +1131,18 @@ def _heat_color(v: float, vmax: float) -> Tuple[str, str]:
 # =============================================================================
 
 def _color(score: int) -> Tuple[str, str]:
-    """(bg, fg) for a score chip."""
+    """(bg, fg) for a score chip. Severity-oriented: stronger match = more
+    alarming color (exact=red, probable=dark orange, component=yellow,
+    weak=light green)."""
     if score >= 85:
-        return "#1e8e3e", "#ffffff"      # green
+        return "#d93025", "#ffffff"      # red — exact match, highest concern
     if score >= 60:
-        return "#f9ab00", "#202124"      # yellow
+        return "#e8710a", "#ffffff"      # dark orange — probable
     if score >= 30:
-        return "#e8710a", "#ffffff"      # orange
+        return "#f9ab00", "#202124"      # yellow — component-level
     if score >= 1:
-        return "#d93025", "#ffffff"      # red
-    return "#9aa0a6", "#ffffff"          # gray
+        return "#81c995", "#202124"      # light green — weak match
+    return "#9aa0a6", "#ffffff"          # gray — no association
 
 
 def _chip(score: int) -> str:
@@ -1205,8 +1207,8 @@ def build_html(features: List[Feature], releases: List[ReleaseNotes],
     tr:hover td{background:#f8fbff}
     .chip{display:inline-block;min-width:34px;text-align:center;border-radius:12px;
           padding:2px 8px;font-weight:700;font-size:12px}
-    .band-exact{border-left:4px solid #1e8e3e}.band-probable{border-left:4px solid #f9ab00}
-    .band-component{border-left:4px solid #e8710a}.band-weak{border-left:4px solid #d93025}
+    .band-exact{border-left:4px solid #d93025}.band-probable{border-left:4px solid #e8710a}
+    .band-component{border-left:4px solid #f9ab00}.band-weak{border-left:4px solid #81c995}
     .mono{font-family:Consolas,Menlo,monospace;font-size:12px}
     .tag{display:inline-block;background:#e8f0fe;color:#174ea6;border-radius:4px;
          padding:1px 6px;margin:1px 2px;font-size:11px}
@@ -1561,7 +1563,7 @@ def build_xlsx(path: str, features: List[Feature], releases: List[ReleaseNotes],
         cell = ws.cell(row=ws.max_row, column=1)
         cell.fill = fill_for(sc)
         cell.font = Font(bold=True,
-                         color="202124" if 60 <= sc < 85 else "FFFFFF")
+                         color="FFFFFF" if sc >= 60 else "202124")
     ws.column_dimensions["A"].width = 42; ws.column_dimensions["B"].width = 40
     for col, w in (("C", 34), ("D", 26), ("E", 22), ("F", 26), ("G", 22)):
         ws.column_dimensions[col].width = w
@@ -1582,8 +1584,8 @@ def build_xlsx(path: str, features: List[Feature], releases: List[ReleaseNotes],
                        ", ".join(it.fixed_versions)])
             c = ws.cell(row=ws.max_row, column=1)
             c.fill = fill_for(m.score)
-            c.font = Font(bold=True, color="FFFFFF" if m.score >= 85 or m.score < 60
-                          else "202124")
+            c.font = Font(bold=True,
+                          color="FFFFFF" if m.score >= 60 else "202124")
             ws.cell(row=ws.max_row, column=7).alignment = Alignment(wrap_text=True)
         ws.auto_filter.ref = ws.dimensions
 
